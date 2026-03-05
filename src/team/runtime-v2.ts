@@ -16,7 +16,7 @@
 
 import { join, resolve } from 'path';
 import { existsSync } from 'fs';
-import { mkdir, rm, readdir } from 'fs/promises';
+import { mkdir, rm, readdir, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { TeamPaths, absPath, teamStateRoot } from './state-paths.js';
 import {
@@ -51,6 +51,19 @@ import type {
   ShutdownAck,
 } from './types.js';
 import type { TeamPhase } from './phase-controller.js';
+import { validateTeamName } from './team-name.js';
+import type { CliAgentType } from './model-contract.js';
+import {
+  buildWorkerArgv, resolveValidatedBinaryPath,
+  getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs,
+} from './model-contract.js';
+import {
+  createTeamSession, spawnWorkerInPane, sendToWorker,
+  waitForPaneReady, type WorkerPaneConfig,
+} from './tmux-session.js';
+import {
+  composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay,
+} from './worker-bootstrap.js';
 
 // ---------------------------------------------------------------------------
 // Feature flag
@@ -164,70 +177,340 @@ export interface StartTeamV2Config {
   cwd: string;
 }
 
+// ---------------------------------------------------------------------------
+// V2 task instruction builder — CLI API lifecycle, NO done.json
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the initial task instruction for v2 workers.
+ * Workers use `omc team api` CLI commands for all lifecycle transitions.
+ */
+function buildV2TaskInstruction(
+  teamName: string,
+  workerName: string,
+  task: { subject: string; description: string },
+  taskId: string,
+): string {
+  return [
+    `## Initial Task Assignment`,
+    `Task ID: ${taskId}`,
+    `Worker: ${workerName}`,
+    `Subject: ${task.subject}`,
+    ``,
+    task.description,
+    ``,
+    `## Task Lifecycle (CLI API)`,
+    `1. Claim your task:`,
+    `   omc team api claim-task --input '{"team_name":"${teamName}","task_id":"${taskId}","worker":"${workerName}"}' --json`,
+    `2. Do the work described above`,
+    `3. On completion (use the claim_token from step 1):`,
+    `   omc team api transition-task-status --input '{"team_name":"${teamName}","task_id":"${taskId}","from":"in_progress","to":"completed","claim_token":"<claim_token>"}' --json`,
+    `4. On failure (use the claim_token from step 1):`,
+    `   omc team api transition-task-status --input '{"team_name":"${teamName}","task_id":"${taskId}","from":"in_progress","to":"failed","claim_token":"<claim_token>"}' --json`,
+    ``,
+    `IMPORTANT: Use the CLI API commands above for all task state transitions.`,
+    `Do NOT write done.json or edit task files directly.`,
+    `After completing or failing the task, exit immediately.`,
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// V2 worker spawning — direct tmux pane creation, no v1 delegation
+// ---------------------------------------------------------------------------
+
+async function notifyPaneWithRetry(
+  sessionName: string,
+  paneId: string,
+  message: string,
+  maxAttempts = 6,
+  retryDelayMs = 350,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (await sendToWorker(sessionName, paneId, message)) {
+      return true;
+    }
+    if (attempt < maxAttempts) {
+      await new Promise(r => setTimeout(r, retryDelayMs));
+    }
+  }
+  return false;
+}
+
+interface SpawnV2WorkerOptions {
+  sessionName: string;
+  leaderPaneId: string;
+  existingWorkerPaneIds: string[];
+  teamName: string;
+  workerName: string;
+  workerIndex: number;
+  agentType: CliAgentType;
+  task: { subject: string; description: string };
+  taskId: string;
+  cwd: string;
+  resolvedBinaryPaths: Partial<Record<CliAgentType, string>>;
+}
+
+/**
+ * Spawn a single v2 worker in a tmux pane.
+ * Writes CLI API inbox (no done.json), waits for ready, sends inbox path.
+ */
+async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<string | null> {
+  const { execFile } = await import('child_process');
+  const { promisify } = await import('util');
+  const execFileAsync = promisify(execFile);
+
+  // Split new pane off the last existing pane (or leader if first worker)
+  const splitTarget = opts.existingWorkerPaneIds.length === 0
+    ? opts.leaderPaneId
+    : opts.existingWorkerPaneIds[opts.existingWorkerPaneIds.length - 1];
+  const splitType = opts.existingWorkerPaneIds.length === 0 ? '-h' : '-v';
+
+  const splitResult = await execFileAsync('tmux', [
+    'split-window', splitType, '-t', splitTarget,
+    '-d', '-P', '-F', '#{pane_id}',
+    '-c', opts.cwd,
+  ]);
+  const paneId = splitResult.stdout.split('\n')[0]?.trim();
+  if (!paneId) return null;
+
+  const usePromptMode = isPromptModeAgent(opts.agentType);
+
+  // Build v2 task instruction (CLI API, NO done.json)
+  const instruction = buildV2TaskInstruction(
+    opts.teamName, opts.workerName, opts.task, opts.taskId,
+  );
+  await composeInitialInbox(opts.teamName, opts.workerName, instruction, opts.cwd);
+  const relInboxPath = `.omc/state/team/${opts.teamName}/workers/${opts.workerName}/inbox.md`;
+
+  // Build env and launch command
+  const envVars = getModelWorkerEnv(opts.teamName, opts.workerName, opts.agentType);
+  const resolvedBinaryPath = opts.resolvedBinaryPaths[opts.agentType]
+    ?? resolveValidatedBinaryPath(opts.agentType);
+
+  // Resolve model from environment variables
+  const modelForAgent = (() => {
+    if (opts.agentType === 'codex') {
+      return process.env.OMC_EXTERNAL_MODELS_DEFAULT_CODEX_MODEL
+        || process.env.OMC_CODEX_DEFAULT_MODEL
+        || undefined;
+    }
+    if (opts.agentType === 'gemini') {
+      return process.env.OMC_EXTERNAL_MODELS_DEFAULT_GEMINI_MODEL
+        || process.env.OMC_GEMINI_DEFAULT_MODEL
+        || undefined;
+    }
+    return undefined;
+  })();
+
+  const [launchBinary, ...launchArgs] = buildWorkerArgv(opts.agentType, {
+    teamName: opts.teamName,
+    workerName: opts.workerName,
+    cwd: opts.cwd,
+    resolvedBinaryPath,
+    model: modelForAgent,
+  });
+
+  // For prompt-mode agents (codex, gemini), pass instruction via CLI flag
+  if (usePromptMode) {
+    const promptArgs = getPromptModeArgs(
+      opts.agentType, `Read and execute your task from: ${relInboxPath}`,
+    );
+    launchArgs.push(...promptArgs);
+  }
+
+  const paneConfig: WorkerPaneConfig = {
+    teamName: opts.teamName,
+    workerName: opts.workerName,
+    envVars,
+    launchBinary,
+    launchArgs,
+    cwd: opts.cwd,
+  };
+
+  await spawnWorkerInPane(opts.sessionName, paneId, paneConfig);
+
+  // Apply layout
+  try {
+    await execFileAsync('tmux', [
+      'select-layout', '-t', opts.sessionName, 'main-vertical',
+    ]);
+  } catch { /* layout is best-effort */ }
+
+  // For interactive agents, wait for pane readiness then send inbox path
+  if (!usePromptMode) {
+    const paneReady = await waitForPaneReady(paneId);
+    if (!paneReady) {
+      try { await execFileAsync('tmux', ['kill-pane', '-t', paneId]); } catch {}
+      return null;
+    }
+
+    // Handle gemini trust-confirm
+    if (opts.agentType === 'gemini') {
+      const confirmed = await notifyPaneWithRetry(opts.sessionName, paneId, '1');
+      if (!confirmed) {
+        try { await execFileAsync('tmux', ['kill-pane', '-t', paneId]); } catch {}
+        return null;
+      }
+      await new Promise(r => setTimeout(r, 800));
+    }
+
+    // Send inbox path to worker
+    const notified = await notifyPaneWithRetry(
+      opts.sessionName, paneId,
+      `Read and execute your task from: ${relInboxPath}`,
+    );
+    if (!notified) {
+      try { await execFileAsync('tmux', ['kill-pane', '-t', paneId]); } catch {}
+      return null;
+    }
+  }
+
+  return paneId;
+}
+
+// ---------------------------------------------------------------------------
+// startTeamV2 — direct tmux creation, CLI API inbox, NO watchdog
+// ---------------------------------------------------------------------------
+
 /**
  * Start a team with the v2 event-driven runtime.
- * Creates state directory, writes config, spawns workers via tmux, and
- * writes initial inbox instructions via dispatch queue. NO done.json.
+ * Creates state directories, writes config + task files, spawns workers via
+ * tmux split-panes, and writes CLI API inbox instructions. NO done.json.
+ * NO watchdog polling — the leader drives monitoring via monitorTeamV2().
  */
 export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntimeV2> {
   const sanitized = sanitizeTeamName(config.teamName);
   const leaderCwd = resolve(config.cwd);
-  const root = absPath(leaderCwd, TeamPaths.root(sanitized));
+  validateTeamName(sanitized);
 
-  // Ensure state directories
+  // Validate CLIs and pin absolute binary paths
+  const agentTypes = config.agentTypes as CliAgentType[];
+  const resolvedBinaryPaths: Partial<Record<CliAgentType, string>> = {};
+  for (const agentType of [...new Set(agentTypes)]) {
+    resolvedBinaryPaths[agentType] = resolveValidatedBinaryPath(agentType);
+  }
+
+  // Create state directories
   await mkdir(absPath(leaderCwd, TeamPaths.tasks(sanitized)), { recursive: true });
   await mkdir(absPath(leaderCwd, TeamPaths.workers(sanitized)), { recursive: true });
+  await mkdir(join(leaderCwd, '.omc', 'state', 'team', sanitized, 'mailbox'), { recursive: true });
 
-  // Delegate to existing startTeam for the actual tmux/pane creation
-  // which handles worker spawning, overlay writing, etc.
-  // The v2 runtime wraps it with event-driven monitoring instead of watchdog.
-  const { startTeam } = await import('./runtime.js');
-  const v1Runtime = await startTeam({
-    teamName: config.teamName,
-    workerCount: config.workerCount,
-    agentTypes: config.agentTypes as any,
-    tasks: config.tasks,
-    cwd: config.cwd,
-  });
+  // Write task files
+  for (let i = 0; i < config.tasks.length; i++) {
+    const taskId = String(i + 1);
+    const taskFilePath = absPath(leaderCwd, TeamPaths.taskFile(sanitized, taskId));
+    await mkdir(join(taskFilePath, '..'), { recursive: true });
+    await writeFile(taskFilePath, JSON.stringify({
+      id: taskId,
+      subject: config.tasks[i].subject,
+      description: config.tasks[i].description,
+      status: 'pending',
+      owner: null,
+      result: null,
+      created_at: new Date().toISOString(),
+    }, null, 2), 'utf-8');
+  }
 
-  // Write initial event
+  // Set up worker state dirs and overlays (with v2 CLI API instructions)
+  const workerNames: string[] = [];
+  for (let i = 0; i < config.tasks.length; i++) {
+    const wName = `worker-${i + 1}`;
+    workerNames.push(wName);
+    const agentType = (agentTypes[i % agentTypes.length] ?? agentTypes[0] ?? 'claude') as CliAgentType;
+    await ensureWorkerStateDir(sanitized, wName, leaderCwd);
+    await writeWorkerOverlay({
+      teamName: sanitized, workerName: wName, agentType,
+      tasks: config.tasks.map((t, idx) => ({
+        id: String(idx + 1), subject: t.subject, description: t.description,
+      })),
+      cwd: leaderCwd,
+    });
+  }
+
+  // Create tmux session (leader only — workers spawned below)
+  const session = await createTeamSession(sanitized, 0, leaderCwd);
+  const sessionName = session.sessionName;
+  const leaderPaneId = session.leaderPaneId;
+  const workerPaneIds: string[] = [];
+
+  // Build workers info for config
+  const workersInfo: WorkerInfo[] = workerNames.map((wName, i) => ({
+    name: wName,
+    index: i + 1,
+    role: (agentTypes[i % agentTypes.length] ?? agentTypes[0] ?? 'claude') as string,
+    assigned_tasks: [] as string[],
+    working_dir: leaderCwd,
+  }));
+
+  // Write initial v2 config
+  const teamConfig: TeamConfig = {
+    name: sanitized,
+    task: config.tasks.map(t => t.subject).join('; '),
+    agent_type: agentTypes[0] || 'claude',
+    worker_launch_mode: 'interactive',
+    worker_count: config.workerCount,
+    max_workers: 20,
+    workers: workersInfo,
+    created_at: new Date().toISOString(),
+    tmux_session: sessionName,
+    next_task_id: config.tasks.length + 1,
+    leader_cwd: leaderCwd,
+    team_state_root: teamStateRoot(leaderCwd, sanitized),
+    leader_pane_id: leaderPaneId,
+    hud_pane_id: null,
+    resize_hook_name: null,
+    resize_hook_target: null,
+  };
+  await saveTeamConfig(teamConfig, leaderCwd);
+
+  // Spawn workers for initial tasks (up to workerCount concurrent)
+  const maxConcurrent = Math.min(agentTypes.length, config.tasks.length);
+  for (let i = 0; i < maxConcurrent; i++) {
+    const wName = workerNames[i];
+    const taskId = String(i + 1);
+    const task = config.tasks[i];
+    if (!task) break;
+
+    const paneId = await spawnV2Worker({
+      sessionName,
+      leaderPaneId,
+      existingWorkerPaneIds: workerPaneIds,
+      teamName: sanitized,
+      workerName: wName,
+      workerIndex: i,
+      agentType: (agentTypes[i % agentTypes.length] ?? agentTypes[0] ?? 'claude') as CliAgentType,
+      task,
+      taskId,
+      cwd: leaderCwd,
+      resolvedBinaryPaths,
+    });
+
+    if (paneId) {
+      workerPaneIds.push(paneId);
+      const workerInfo = workersInfo[i];
+      if (workerInfo) {
+        workerInfo.pane_id = paneId;
+        workerInfo.assigned_tasks = [taskId];
+      }
+    }
+  }
+
+  // Persist config with pane IDs
+  teamConfig.workers = workersInfo;
+  await saveTeamConfig(teamConfig, leaderCwd);
+
+  // Emit start event — NO watchdog, leader drives via monitorTeamV2()
   await appendTeamEvent(sanitized, {
     type: 'team_leader_nudge',
     worker: 'leader-fixed',
-    reason: `start_team_v2: workers=${config.workerCount} tasks=${config.tasks.length}`,
+    reason: `start_team_v2: workers=${config.workerCount} tasks=${config.tasks.length} panes=${workerPaneIds.length}`,
   }, leaderCwd);
-
-  const sessionName = v1Runtime.sessionName || `omc-team-${sanitized}`;
 
   return {
     teamName: sanitized,
     sanitizedName: sanitized,
     sessionName,
-    config: {
-      name: sanitized,
-      task: config.tasks.map(t => t.subject).join('; '),
-      agent_type: config.agentTypes[0] || 'claude',
-      worker_launch_mode: 'interactive',
-      worker_count: config.workerCount,
-      max_workers: 20,
-      workers: v1Runtime.workerPaneIds?.map((paneId, i) => ({
-        name: `worker-${i + 1}`,
-        index: i + 1,
-        role: config.agentTypes[i] || config.agentTypes[0] || 'claude',
-        assigned_tasks: [],
-        pane_id: paneId,
-        working_dir: leaderCwd,
-      })) || [],
-      created_at: new Date().toISOString(),
-      tmux_session: sessionName,
-      next_task_id: config.tasks.length + 1,
-      leader_cwd: leaderCwd,
-      team_state_root: teamStateRoot(leaderCwd, sanitized),
-      leader_pane_id: v1Runtime.leaderPaneId || null,
-      hud_pane_id: null,
-      resize_hook_name: null,
-      resize_hook_target: null,
-    },
+    config: teamConfig,
     cwd: leaderCwd,
   };
 }

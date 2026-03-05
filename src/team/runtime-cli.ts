@@ -12,7 +12,7 @@ import { join } from 'path';
 import { startTeam, monitorTeam, shutdownTeam } from './runtime.js';
 import type { TeamConfig, TeamRuntime } from './runtime.js';
 import { waitForSentinelReadiness } from './sentinel-gate.js';
-import { isRuntimeV2Enabled, monitorTeamV2, shutdownTeamV2 } from './runtime-v2.js';
+import { isRuntimeV2Enabled, startTeamV2, monitorTeamV2, shutdownTeamV2 } from './runtime-v2.js';
 import type { TeamSnapshotV2 } from './runtime-v2.js';
 
 interface CliInput {
@@ -213,6 +213,7 @@ async function main(): Promise<void> {
     cwd,
   };
 
+  const useV2 = isRuntimeV2Enabled();
   let runtime: TeamRuntime | null = null;
   let finalStatus: 'completed' | 'failed' = 'failed';
   let pollActive = true;
@@ -225,27 +226,31 @@ async function main(): Promise<void> {
     pollActive = false;
     finalStatus = status;
 
-    // 1. Stop watchdog first — prevents late tick from racing with result collection
-    if (runtime?.stopWatchdog) {
+    // 1. Stop watchdog first (v1 only) — prevents late tick from racing with result collection
+    if (!useV2 && runtime?.stopWatchdog) {
       runtime.stopWatchdog();
     }
 
     // 2. Collect task results (watchdog is now stopped, no more writes to tasks/)
     const taskResults = collectTaskResults(stateRoot);
 
-    // 3. Shutdown team with 2s timeout (non-Claude workers never write shutdown-ack.json)
+    // 3. Shutdown team
     if (runtime) {
       try {
-        await shutdownTeam(
-          runtime.teamName,
-          runtime.sessionName,
-          runtime.cwd,
-          2_000,
-          runtime.workerPaneIds,
-          runtime.leaderPaneId,
-        );
+        if (useV2) {
+          await shutdownTeamV2(runtime.teamName, runtime.cwd, { force: true });
+        } else {
+          await shutdownTeam(
+            runtime.teamName,
+            runtime.sessionName,
+            runtime.cwd,
+            2_000,
+            runtime.workerPaneIds,
+            runtime.leaderPaneId,
+          );
+        }
       } catch (err) {
-        process.stderr.write(`[runtime-cli] shutdownTeam error: ${err}\n`);
+        process.stderr.write(`[runtime-cli] shutdown error: ${err}\n`);
       }
     }
 
@@ -282,9 +287,32 @@ async function main(): Promise<void> {
     doShutdown('failed').catch(() => process.exit(1));
   });
 
-  // Start the team
+  // Start the team — v2 uses direct tmux spawn with CLI API inbox (no done.json, no watchdog)
   try {
-    runtime = await startTeam(config);
+    if (useV2) {
+      const v2Runtime = await startTeamV2({
+        teamName,
+        workerCount,
+        agentTypes,
+        tasks,
+        cwd,
+      });
+      const v2PaneIds = v2Runtime.config.workers
+        .map(w => w.pane_id)
+        .filter((p): p is string => typeof p === 'string');
+      runtime = {
+        teamName: v2Runtime.teamName,
+        sessionName: v2Runtime.sessionName,
+        leaderPaneId: v2Runtime.config.leader_pane_id || '',
+        config,
+        workerNames: v2Runtime.config.workers.map(w => w.name),
+        workerPaneIds: v2PaneIds,
+        activeWorkers: new Map(),
+        cwd,
+      };
+    } else {
+      runtime = await startTeam(config);
+    }
   } catch (err) {
     process.stderr.write(`[runtime-cli] startTeam failed: ${err}\n`);
     process.exit(1);
@@ -301,7 +329,7 @@ async function main(): Promise<void> {
   }
 
   // ── V2 event-driven poll loop (no watchdog) ────────────────────────────
-  if (isRuntimeV2Enabled()) {
+  if (useV2) {
     process.stderr.write('[runtime-cli] Using runtime v2 (event-driven, no watchdog)\n');
 
     while (pollActive) {
