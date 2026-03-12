@@ -339,7 +339,7 @@ async function hasWorkerTaskClaimEvidence(
   }
 }
 
-async function hasClaudeStartupEvidence(
+async function hasWorkerStartupEvidence(
   teamName: string,
   workerName: string,
   taskId: string,
@@ -352,7 +352,7 @@ async function hasClaudeStartupEvidence(
   return hasClaimEvidence || hasWorkerStatusProgress(status, taskId);
 }
 
-async function waitForClaudeStartupEvidence(
+async function waitForWorkerStartupEvidence(
   teamName: string,
   workerName: string,
   taskId: string,
@@ -361,7 +361,7 @@ async function waitForClaudeStartupEvidence(
   delayMs = 250,
 ): Promise<boolean> {
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    if (await hasClaudeStartupEvidence(teamName, workerName, taskId, cwd)) {
+    if (await hasWorkerStartupEvidence(teamName, workerName, taskId, cwd)) {
       return true;
     }
     if (attempt < attempts) {
@@ -402,7 +402,6 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
   const instruction = buildV2TaskInstruction(
     opts.teamName, opts.workerName, opts.task, opts.taskId,
   );
-  const relInboxPath = `.omc/state/team/${opts.teamName}/workers/${opts.workerName}/inbox.md`;
   const inboxTriggerMessage = generateTriggerMessage(opts.teamName, opts.workerName);
   if (usePromptMode) {
     await composeInitialInbox(opts.teamName, opts.workerName, instruction, opts.cwd);
@@ -442,10 +441,7 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
 
   // For prompt-mode agents (codex, gemini), pass instruction via CLI flag
   if (usePromptMode) {
-    const promptArgs = getPromptModeArgs(
-      opts.agentType, inboxTriggerMessage,
-    );
-    launchArgs.push(...promptArgs);
+    launchArgs.push(...getPromptModeArgs(opts.agentType, instruction));
   }
 
   const paneConfig: WorkerPaneConfig = {
@@ -515,7 +511,7 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
   }
 
   if (opts.agentType === 'claude') {
-    const settled = await waitForClaudeStartupEvidence(
+    const settled = await waitForWorkerStartupEvidence(
       opts.teamName,
       opts.workerName,
       opts.taskId,
@@ -530,7 +526,7 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
           startupFailureReason: `${renotified.reason}:startup_evidence_missing`,
         };
       }
-      const settledAfterRetry = await waitForClaudeStartupEvidence(
+      const settledAfterRetry = await waitForWorkerStartupEvidence(
         opts.teamName,
         opts.workerName,
         opts.taskId,
@@ -543,6 +539,22 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
           startupFailureReason: 'claude_startup_evidence_missing',
         };
       }
+    }
+  }
+
+  if (usePromptMode) {
+    const settled = await waitForWorkerStartupEvidence(
+      opts.teamName,
+      opts.workerName,
+      opts.taskId,
+      opts.cwd,
+    );
+    if (!settled) {
+      return {
+        paneId,
+        startupAssigned: false,
+        startupFailureReason: `${opts.agentType}_startup_evidence_missing`,
+      };
     }
   }
 
